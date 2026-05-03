@@ -477,7 +477,7 @@ def _enrich(conn, row):
 #  ДАШБОРД — ТОКЕНЫ
 # ═══════════════════════════════════════════════════════════════
 
-def generate_dashboard_token(user_id, chat_id, username="", hours=72):
+def generate_dashboard_token(user_id, chat_id, username="", hours=876000):
     token = secrets.token_urlsafe(32)
     now = datetime.now()
     expires = now + timedelta(hours=hours)
