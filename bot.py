@@ -307,7 +307,7 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваш токен доступа, сэр:\n\n"
         f"`{token}`\n\n"
         f"🔗 Откройте: {dashboard_url}\n\n"
-        f"⏳ Действителен 72 часа\n"
+        f"⏳ Токен бессрочный\n"
         f"🔒 Привязан к этому чату\n\n"
         f"_Скопируйте токен и вставьте на странице._"
     )
