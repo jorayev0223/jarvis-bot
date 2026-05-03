@@ -1,0 +1,768 @@
+"""
+J.A.R.V.I.S. v5 — Telegram Bot
+Все функции: голос, текст, задачи, подзадачи, комментарии, проекты,
+теги, назначения, файлы, статистика, дайджест, дашборд.
+"""
+
+import os
+import logging
+import tempfile
+import threading
+import re
+import json as json_module
+from datetime import datetime, timedelta
+
+import anthropic
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+)
+
+import database as db
+from ai_assistant import extract_task_from_text, generate_status_report
+
+# ─── Настройка ────────────────────────────────────────────────
+
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не найден!")
+if not ANTHROPIC_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY не найден!")
+
+claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+logger = logging.getLogger("jarvis")
+
+PRIORITY_EMOJI = {"high": "🔴", "medium": "🔵", "low": "⚪"}
+PRIORITY_LABEL = {"high": "КРИТИЧЕСКИЙ", "medium": "СТАНДАРТ", "low": "НИЗКИЙ"}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ФОРМАТИРОВАНИЕ
+# ═══════════════════════════════════════════════════════════════
+
+def format_task(task, index=None):
+    p = task.get("priority", "medium")
+    emoji = PRIORITY_EMOJI.get(p, "🔵")
+    label = PRIORITY_LABEL.get(p, "СТАНДАРТ")
+    status = "✅" if task.get("status") == "done" else emoji
+
+    header = f"{status} "
+    if index is not None:
+        header += f"*{index}.* "
+    header += f"*{task['title']}*  `#{task['id']}`"
+
+    lines = [header]
+    if task.get("description"):
+        lines.append(f"   _{task['description']}_")
+    lines.append(f"   Приоритет: {label}")
+    if task.get("category"):
+        lines.append(f"   Категория: {task['category']}")
+    if task.get("tags"):
+        lines.append(f"   🏷 {task['tags']}")
+    if task.get("deadline"):
+        dl = datetime.fromisoformat(task["deadline"])
+        dl_str = dl.strftime("%d.%m.%Y %H:%M")
+        if task.get("status") != "done" and dl < datetime.now():
+            lines.append(f"   ⚠️ *ПРОСРОЧЕНО:* {dl_str}")
+        else:
+            lines.append(f"   ⏰ Дедлайн: {dl_str}")
+    if task.get("recurrence"):
+        rec_map = {"daily": "ежедневно", "weekly": "еженедельно", "monthly": "ежемесячно"}
+        lines.append(f"   🔄 {rec_map.get(task['recurrence'], task['recurrence'])}")
+    if task.get("assignees"):
+        names = [f"@{a['username']}" if a.get("username") else a.get("first_name", "?")
+                 for a in task["assignees"]]
+        lines.append(f"   👤 {', '.join(names)}")
+    if task.get("subtasks"):
+        done_c = sum(1 for s in task["subtasks"] if s["done"])
+        total_c = len(task["subtasks"])
+        lines.append(f"   📝 Подзадачи: {done_c}/{total_c}")
+    if task.get("comment_count", 0) > 0:
+        lines.append(f"   💬 Комментариев: {task['comment_count']}")
+    if task.get("project_id"):
+        proj = db.get_project(task["project_id"])
+        if proj:
+            lines.append(f"   📁 {proj['emoji']} {proj['name']}")
+    if task.get("files"):
+        lines.append(f"   📎 Файлов: {len(task['files'])}")
+
+    return "\n".join(lines)
+
+
+def task_buttons(task_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅Готово", callback_data=f"done_{task_id}"),
+         InlineKeyboardButton("🗑Удалить", callback_data=f"del_{task_id}")],
+        [InlineKeyboardButton("+1ч", callback_data=f"post_1h_{task_id}"),
+         InlineKeyboardButton("+3ч", callback_data=f"post_3h_{task_id}"),
+         InlineKeyboardButton("+1д", callback_data=f"post_1d_{task_id}")],
+        [InlineKeyboardButton("👤Назначить", callback_data=f"assign_{task_id}"),
+         InlineKeyboardButton("📎Файл", callback_data=f"file_{task_id}")],
+        [InlineKeyboardButton("📝Подзадачи", callback_data=f"subs_{task_id}"),
+         InlineKeyboardButton("💬Комменты", callback_data=f"comms_{task_id}")],
+        [InlineKeyboardButton("🏷Теги", callback_data=f"tags_{task_id}"),
+         InlineKeyboardButton("📁Проект", callback_data=f"setprj_{task_id}")],
+    ])
+
+
+def subtask_btns(task_id, subtasks):
+    rows = []
+    for s in subtasks:
+        icon = "✅" if s["done"] else "⬜"
+        rows.append([InlineKeyboardButton(f"{icon} {s['title']}", callback_data=f"togsub_{s['id']}")])
+    rows.append([
+        InlineKeyboardButton("➕ Добавить", callback_data=f"addsub_{task_id}"),
+        InlineKeyboardButton("⬅️ Назад", callback_data=f"view_{task_id}")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def project_btns(chat_id, task_id):
+    projects = db.get_projects(chat_id)
+    if not projects:
+        return None
+    rows = [[InlineKeyboardButton(f"{p['emoji']} {p['name']}", callback_data=f"prj_{task_id}_{p['id']}")]
+            for p in projects]
+    rows.append([InlineKeyboardButton("❌ Без проекта", callback_data=f"prj_{task_id}_0")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"view_{task_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  КОМАНДЫ
+# ═══════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 *J.A.R.V.I.S. v5 активирован!*\n\n"
+        "Я ваш персональный ИИ-ассистент.\n\n"
+        "📝 Просто напишите или отправьте голосовое — я создам задачу.\n"
+        "Пример: _Напомни завтра в 10 позвонить в банк_\n\n"
+        "Команды:\n"
+        "/tasks — активные задачи\n"
+        "/all — все задачи\n"
+        "/my — мои задачи\n"
+        "/done N — выполнить задачу\n"
+        "/delete N — удалить\n"
+        "/search слово — поиск\n"
+        "/stats — статистика\n"
+        "/projects — проекты\n"
+        "/newproject Имя — создать проект\n"
+        "/dashboard — веб-дашборд\n"
+        "/help — помощь"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasks = db.get_active_tasks(update.effective_chat.id)
+    if not tasks:
+        await update.message.reply_text("✨ Нет активных задач, сэр.")
+        return
+    report = generate_status_report(claude, [{"title": t["title"], "priority": t["priority"],
+              "deadline": t.get("deadline"), "status": t["status"]} for t in tasks[:10]])
+    lines = [f"🤖 _{report}_\n\n📋 *Активные задачи ({len(tasks)}):*\n"]
+    for i, t in enumerate(tasks, 1):
+        lines.append(format_task(t, i))
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasks = db.get_all_tasks(update.effective_chat.id)
+    if not tasks:
+        await update.message.reply_text("📭 Задач нет.")
+        return
+    lines = [f"📋 *Все задачи ({len(tasks)}):*\n"]
+    for i, t in enumerate(tasks, 1):
+        lines.append(format_task(t, i))
+        lines.append("")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n_...список обрезан_"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasks = db.get_user_tasks(update.effective_chat.id, update.effective_user.id)
+    if not tasks:
+        await update.message.reply_text("✨ У вас нет назначенных задач.")
+        return
+    lines = [f"👤 *Ваши задачи ({len(tasks)}):*\n"]
+    for i, t in enumerate(tasks, 1):
+        lines.append(format_task(t, i))
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Укажите номер: /done 1")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Укажите номер задачи.")
+        return
+    task = db.complete_task(task_id, update.effective_user.id, update.effective_chat.id)
+    if task:
+        await update.message.reply_text(f"✅ Задача *#{task_id}* выполнена!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Задача не найдена.")
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Укажите номер: /delete 1")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Укажите номер задачи.")
+        return
+    if db.delete_task(task_id, update.effective_user.id, update.effective_chat.id):
+        await update.message.reply_text(f"🗑 Задача *#{task_id}* удалена.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Задача не найдена.")
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = db.clear_done_tasks(update.effective_chat.id)
+    await update.message.reply_text(f"🧹 Удалено выполненных задач: {count}")
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Укажите запрос: /search отчёт")
+        return
+    query = " ".join(context.args)
+    tasks = db.search_tasks(update.effective_chat.id, query)
+    if not tasks:
+        await update.message.reply_text(f"🔍 По запросу «{query}» ничего не найдено.")
+        return
+    lines = [f"🔍 *Результаты «{query}» ({len(tasks)}):*\n"]
+    for i, t in enumerate(tasks, 1):
+        lines.append(format_task(t, i))
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = db.get_stats(update.effective_chat.id)
+    if not stats:
+        await update.message.reply_text("📊 Статистика пуста.")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["📊 *Статистика команды:*\n"]
+    for i, s in enumerate(stats[:10]):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        name = s.get("user_name") or s.get("username") or "?"
+        lines.append(
+            f"{medal} *{name}*: создано {s['tasks_created']}, "
+            f"выполнено {s['tasks_completed']}, назначено {s['tasks_assigned']}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    projects = db.get_projects(update.effective_chat.id)
+    if not projects:
+        await update.message.reply_text("📁 Нет проектов. Создайте: /newproject Название")
+        return
+    lines = ["📁 *Проекты:*\n"]
+    for p in projects:
+        lines.append(f"{p['emoji']} *{p['name']}* (ID: {p['id']})")
+        if p.get("description"):
+            lines.append(f"   _{p['description']}_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_newproject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Укажите название: /newproject Маркетинг")
+        return
+    name = " ".join(context.args)
+    proj = db.create_project(update.effective_chat.id, name)
+    await update.message.reply_text(
+        f"📁 Проект *{name}* создан! (ID: {proj['id']})", parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ДАШБОРД
+# ═══════════════════════════════════════════════════════════════
+
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    username = user.username or user.first_name or "Agent"
+
+    token = db.generate_dashboard_token(
+        user_id=user.id, chat_id=chat_id, username=username, hours=72)
+
+    dashboard_url = os.environ.get(
+        "DASHBOARD_URL", "https://worker-production-6faa.up.railway.app")
+
+    text = (
+        f"🖥 *J.A.R.V.I.S. Dashboard*\n\n"
+        f"Ваш токен доступа, сэр:\n\n"
+        f"`{token}`\n\n"
+        f"🔗 Откройте: {dashboard_url}\n\n"
+        f"⏳ Действителен 72 часа\n"
+        f"🔒 Привязан к этому чату\n\n"
+        f"_Скопируйте токен и вставьте на странице._"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CALLBACK КНОПКИ
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+    user = q.from_user
+
+    if d.startswith("done_"):
+        tid = int(d.split("_")[1])
+        task = db.complete_task(tid, user.id, q.message.chat_id)
+        if task:
+            await q.edit_message_text(f"✅ Задача *#{tid}* выполнена!\n\n{format_task(task)}", parse_mode="Markdown")
+
+    elif d.startswith("del_"):
+        tid = int(d.split("_")[1])
+        if db.delete_task(tid, user.id, q.message.chat_id):
+            await q.edit_message_text(f"🗑 Задача *#{tid}* удалена.", parse_mode="Markdown")
+
+    elif d.startswith("post_"):
+        parts = d.split("_")
+        delta_str = parts[1]
+        tid = int(parts[2])
+        deltas = {"1h": timedelta(hours=1), "3h": timedelta(hours=3), "1d": timedelta(days=1)}
+        delta = deltas.get(delta_str, timedelta(hours=1))
+        task = db.postpone_task(tid, user.id, delta)
+        if task:
+            await q.edit_message_text(
+                f"⏳ Дедлайн перенесён!\n\n{format_task(task)}", parse_mode="Markdown",
+                reply_markup=task_buttons(tid))
+
+    elif d.startswith("assign_"):
+        tid = int(d.split("_")[1])
+        context.user_data["await_assign"] = tid
+        await q.edit_message_text(
+            f"👤 Задача *#{tid}*\nОтправьте @username или перешлите сообщение пользователя.",
+            parse_mode="Markdown")
+
+    elif d.startswith("file_"):
+        tid = int(d.split("_")[1])
+        context.user_data["await_file"] = tid
+        await q.edit_message_text(
+            f"📎 Задача *#{tid}*\nОтправьте файл или фото.", parse_mode="Markdown")
+
+    elif d.startswith("subs_"):
+        tid = int(d.split("_")[1])
+        t = db.get_task(tid)
+        if t:
+            subs = t.get("subtasks", [])
+            done_c = sum(1 for s in subs if s["done"])
+            header = f"📝 *Подзадачи #{tid}* ({done_c}/{len(subs)})\n_{t['title']}_"
+            await q.edit_message_text(header, parse_mode="Markdown",
+                                       reply_markup=subtask_btns(tid, subs))
+
+    elif d.startswith("addsub_"):
+        tid = int(d.split("_")[1])
+        context.user_data["await_subtask"] = tid
+        await q.edit_message_text(
+            f"📝 Задача *#{tid}*\nНапишите подзадачу (или несколько через Enter).",
+            parse_mode="Markdown")
+
+    elif d.startswith("togsub_"):
+        sid = int(d.split("_")[1])
+        db.toggle_subtask(sid)
+        with db.get_connection() as conn:
+            row = conn.execute("SELECT task_id FROM subtasks WHERE id=?", (sid,)).fetchone()
+        if row:
+            tid = row["task_id"]
+            t = db.get_task(tid)
+            subs = t.get("subtasks", [])
+            done_c = sum(1 for s in subs if s["done"])
+            header = f"📝 *Подзадачи #{tid}* ({done_c}/{len(subs)})\n_{t['title']}_"
+            await q.edit_message_text(header, parse_mode="Markdown",
+                                       reply_markup=subtask_btns(tid, subs))
+
+    elif d.startswith("comms_"):
+        tid = int(d.split("_")[1])
+        comments = db.get_comments(tid)
+        t = db.get_task(tid)
+        lines = [f"💬 *Комментарии к #{tid}*\n_{t['title']}_\n"]
+        if comments:
+            for c in reversed(comments):
+                dt = datetime.fromisoformat(c["created_at"]).strftime("%d.%m %H:%M")
+                lines.append(f"*{c['user_name']}* ({dt}):\n{c['text']}\n")
+        else:
+            lines.append("_Пока нет комментариев._")
+        lines.append("\n✏️ Отправьте сообщение чтобы добавить комментарий.")
+        context.user_data["await_comment"] = tid
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"view_{tid}")]])
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+    elif d.startswith("tags_"):
+        tid = int(d.split("_")[1])
+        context.user_data["await_tags"] = tid
+        t = db.get_task(tid)
+        cur_tags = t.get("tags", "") if t else ""
+        await q.edit_message_text(
+            f"🏷 Задача *#{tid}*\nТеги: _{cur_tags or 'нет'}_\n\nНапишите теги через запятую:",
+            parse_mode="Markdown")
+
+    elif d.startswith("setprj_"):
+        tid = int(d.split("_")[1])
+        kb = project_btns(q.message.chat_id, tid)
+        if kb:
+            await q.edit_message_text(
+                f"📁 Выберите проект для задачи *#{tid}*:",
+                parse_mode="Markdown", reply_markup=kb)
+        else:
+            await q.edit_message_text(
+                "📁 Нет проектов. Создайте: /newproject Название", parse_mode="Markdown")
+
+    elif d.startswith("prj_"):
+        parts = d.split("_")
+        tid = int(parts[1])
+        pid = int(parts[2])
+        db.set_project(tid, pid if pid != 0 else None)
+        t = db.get_task(tid)
+        await q.edit_message_text(
+            f"📁 Проект обновлён!\n\n{format_task(t)}", parse_mode="Markdown",
+            reply_markup=task_buttons(tid))
+
+    elif d.startswith("view_"):
+        tid = int(d.split("_")[1])
+        t = db.get_task(tid)
+        if t:
+            await q.edit_message_text(format_task(t), parse_mode="Markdown",
+                                       reply_markup=task_buttons(tid))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ГОЛОСОВЫЕ СООБЩЕНИЯ
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    processing = await update.message.reply_text("🎤 Обрабатываю голосовое сообщение...")
+
+    try:
+        voice = update.message.voice or update.message.audio
+        file = await context.bot.get_file(voice.file_id)
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            ogg_path = f.name
+        await file.download_to_drive(ogg_path)
+
+        wav_path = ogg_path.replace(".ogg", ".wav")
+        import subprocess
+        subprocess.run(["ffmpeg", "-i", ogg_path, "-ar", "16000", "-ac", "1",
+                         wav_path, "-y"], capture_output=True)
+
+        import speech_recognition as sr
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+        text = recognizer.recognize_google(audio, language="ru-RU")
+
+        os.unlink(ogg_path)
+        os.unlink(wav_path)
+
+        await processing.edit_text(f"🎤 Распознано: _{text}_\n\n⏳ Анализирую...", parse_mode="Markdown")
+        await _process_task_text(update, context, text, processing)
+
+    except Exception as e:
+        logger.error(f"Ошибка голосового: {e}")
+        await processing.edit_text("❌ Не удалось распознать. Попробуйте текстом.")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ТЕКСТОВЫЕ СООБЩЕНИЯ
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # Проверяем ожидающие действия
+    if context.user_data.get("await_subtask"):
+        tid = context.user_data.pop("await_subtask")
+        for line in text.split("\n"):
+            line = line.strip()
+            if line:
+                db.add_subtask(tid, line)
+        t = db.get_task(tid)
+        subs = t.get("subtasks", [])
+        done_c = sum(1 for s in subs if s["done"])
+        await update.message.reply_text(
+            f"📝 *Подзадачи #{tid}* ({done_c}/{len(subs)})\n_{t['title']}_",
+            parse_mode="Markdown", reply_markup=subtask_btns(tid, subs))
+        return
+
+    if context.user_data.get("await_comment"):
+        tid = context.user_data.pop("await_comment")
+        name = update.effective_user.first_name or update.effective_user.username or "?"
+        db.add_comment(tid, update.effective_user.id, name, text)
+        await update.message.reply_text(f"💬 Комментарий добавлен к задаче *#{tid}*", parse_mode="Markdown")
+        return
+
+    if context.user_data.get("await_tags"):
+        tid = context.user_data.pop("await_tags")
+        db.update_tags(tid, text)
+        t = db.get_task(tid)
+        await update.message.reply_text(
+            f"🏷 Теги обновлены!\n\n{format_task(t)}", parse_mode="Markdown",
+            reply_markup=task_buttons(tid))
+        return
+
+    if context.user_data.get("await_assign"):
+        tid = context.user_data.pop("await_assign")
+        usernames = re.findall(r"@(\w+)", text)
+        if usernames:
+            for uname in usernames:
+                db.add_assignee(tid, 0, username=uname)
+            await update.message.reply_text(
+                f"👤 Назначены: {', '.join('@'+u for u in usernames)} на задачу *#{tid}*",
+                parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Не нашёл @username в сообщении.")
+        return
+
+    # Обработка как задачи через AI
+    processing = await update.message.reply_text("⏳ Анализирую...")
+    await _process_task_text(update, context, text, processing)
+
+
+async def _process_task_text(update, context, text, processing_msg):
+    result = extract_task_from_text(claude, text)
+    if not result:
+        await processing_msg.edit_text("❌ Не удалось обработать. Попробуйте снова.")
+        return
+
+    if not result.get("is_task"):
+        jarvis_msg = result.get("jarvis_response", "Не обнаружил задачу, сэр.")
+        await processing_msg.edit_text(f"🤖 {jarvis_msg}")
+        return
+
+    user = update.effective_user
+    creator_name = user.first_name or user.username or "?"
+    chat_id = update.effective_chat.id
+
+    task = db.add_task(
+        chat_id=chat_id,
+        creator_id=user.id,
+        title=result.get("title", text[:100]),
+        description=result.get("description", ""),
+        priority=result.get("priority", "medium"),
+        category=result.get("category", ""),
+        deadline=result.get("deadline"),
+        creator_name=creator_name,
+        recurrence=result.get("recurrence"),
+    )
+
+    # Назначение @упомянутых
+    mentioned = result.get("mentioned_usernames", [])
+    for uname in mentioned:
+        db.add_assignee(task["id"], 0, username=uname)
+
+    jarvis_msg = result.get("jarvis_response", "Задача создана, сэр.")
+    response = f"🤖 {jarvis_msg}\n\n{format_task(task)}"
+    await processing_msg.edit_text(response, parse_mode="Markdown", reply_markup=task_buttons(task["id"]))
+
+    # Уведомление назначенным в личку
+    for uname in mentioned:
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=f"📩 Вам назначена задача *#{task['id']}*: {task['title']}",
+                parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ФАЙЛЫ И ФОТО
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get("await_file")
+    msg = update.message
+
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        file_type = "photo"
+        file_name = "photo.jpg"
+    elif msg.document:
+        file_id = msg.document.file_id
+        file_type = "document"
+        file_name = msg.document.file_name or "file"
+    else:
+        return
+
+    if tid:
+        context.user_data.pop("await_file", None)
+        db.add_file(tid, file_id, file_type, file_name)
+        t = db.get_task(tid)
+        await msg.reply_text(
+            f"📎 Файл прикреплён к задаче *#{tid}*\n\n{format_task(t)}",
+            parse_mode="Markdown", reply_markup=task_buttons(tid))
+    elif msg.caption:
+        # Фото с подписью = новая задача
+        processing = await msg.reply_text("⏳ Создаю задачу из фото...")
+        result = extract_task_from_text(claude, msg.caption)
+        if result and result.get("is_task"):
+            user = update.effective_user
+            task = db.add_task(
+                chat_id=msg.chat_id, creator_id=user.id,
+                title=result.get("title", msg.caption[:100]),
+                description=result.get("description", ""),
+                priority=result.get("priority", "medium"),
+                category=result.get("category", ""),
+                deadline=result.get("deadline"),
+                creator_name=user.first_name or "?")
+            db.add_file(task["id"], file_id, file_type, file_name)
+            await processing.edit_text(
+                f"📎 Задача с файлом создана!\n\n{format_task(task)}",
+                parse_mode="Markdown", reply_markup=task_buttons(task["id"]))
+        else:
+            await processing.edit_text("Не удалось создать задачу из подписи.")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  НАПОМИНАНИЯ И ДАЙДЖЕСТ
+# ═══════════════════════════════════════════════════════════════
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    reminders = db.get_tasks_needing_reminder()
+
+    for task in reminders.get("upcoming", []):
+        try:
+            dl = datetime.fromisoformat(task["deadline"])
+            text = (f"⏰ *Напоминание, сэр!*\n\n"
+                    f"Задача *#{task['id']}* — {task['title']}\n"
+                    f"Дедлайн через 15 минут: {dl.strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"_Рекомендую приступить немедленно._")
+            await context.bot.send_message(chat_id=task["chat_id"], text=text, parse_mode="Markdown")
+            db.mark_reminded(task["id"], "15min")
+        except Exception as e:
+            logger.error(f"Ошибка напоминания: {e}")
+
+    for task in reminders.get("overdue", []):
+        try:
+            text = (f"🚨 *Внимание, сэр!*\n\n"
+                    f"Задача *#{task['id']}* — {task['title']}\n"
+                    f"*ПРОСРОЧЕНА!*\n\n"
+                    f"_Отметьте как выполненную (/done {task['id']}) или обновите дедлайн._")
+            await context.bot.send_message(chat_id=task["chat_id"], text=text, parse_mode="Markdown")
+            db.mark_reminded(task["id"], "overdue")
+        except Exception as e:
+            logger.error(f"Ошибка напоминания: {e}")
+
+
+async def morning_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Утренний дайджест в 09:00 UTC+5 (04:00 UTC)."""
+    chats = db.get_all_chats_with_tasks()
+    for chat_id in chats:
+        try:
+            tasks = db.get_active_tasks(chat_id)
+            if not tasks:
+                continue
+            overdue = [t for t in tasks if t.get("deadline") and
+                       datetime.fromisoformat(t["deadline"]) < datetime.now()]
+            today = [t for t in tasks if t.get("deadline") and
+                     datetime.fromisoformat(t["deadline"]).date() == datetime.now().date()]
+            high = [t for t in tasks if t.get("priority") == "high"]
+
+            lines = ["🌅 *Доброе утро, сэр! Утренний дайджест:*\n"]
+            lines.append(f"📋 Активных задач: {len(tasks)}")
+            if overdue:
+                lines.append(f"⚠️ Просроченных: {len(overdue)}")
+            if today:
+                lines.append(f"\n📅 *На сегодня ({len(today)}):*")
+                for t in today:
+                    dl = datetime.fromisoformat(t["deadline"]).strftime("%H:%M")
+                    lines.append(f"  {PRIORITY_EMOJI.get(t['priority'],'🔵')} {t['title']} — {dl}")
+            if high and not today:
+                lines.append(f"\n🔴 *Критичные ({len(high)}):*")
+                for t in high[:5]:
+                    lines.append(f"  {t['title']}")
+            lines.append("\n_Хорошего дня, сэр!_")
+
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка дайджеста для {chat_id}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ЗАПУСК
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    logger.info("🤖 J.A.R.V.I.S. v5 инициализация...")
+
+    db.init_db()
+    logger.info("✅ База данных готова")
+
+    # Запуск веб-сервера в отдельном потоке
+    try:
+        from web import start_web
+        web_thread = threading.Thread(target=start_web, daemon=True)
+        web_thread.start()
+        logger.info("✅ Веб-дашборд запущен")
+    except Exception as e:
+        logger.warning(f"⚠️ Веб-дашборд не запустился: {e}")
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
+    app.add_handler(CommandHandler("all", cmd_all))
+    app.add_handler(CommandHandler("my", cmd_my))
+    app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("projects", cmd_projects))
+    app.add_handler(CommandHandler("newproject", cmd_newproject))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
+
+    # Кнопки
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Голосовые
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
+    # Файлы и фото
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file))
+
+    # Текст
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Напоминания каждые 60 сек
+    app.job_queue.run_repeating(check_reminders, interval=60, first=10, name="reminders")
+
+    # Утренний дайджест в 04:00 UTC (= 09:00 Ташкент UTC+5)
+    from datetime import time as dt_time
+    app.job_queue.run_daily(morning_digest, time=dt_time(hour=4, minute=0), name="digest")
+
+    logger.info("🚀 J.A.R.V.I.S. v5 запущен!")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    main()

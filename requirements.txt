@@ -1,0 +1,8 @@
+python-telegram-bot[job-queue]==21.6
+anthropic==0.96.0
+python-dotenv==1.0.1
+pydub==0.25.1
+SpeechRecognition==3.11.0
+requests>=2.31.0
+flask>=3.0.0
+audioop-lts>=0.2.1
