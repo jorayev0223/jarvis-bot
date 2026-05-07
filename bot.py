@@ -1,7 +1,7 @@
 """
-J.A.R.V.I.S. v5 — Telegram Bot
-Все функции: голос, текст, задачи, подзадачи, комментарии, проекты,
-теги, назначения, файлы, статистика, дайджест, дашборд.
+J.A.R.V.I.S. v5.1 — Telegram Bot
+Обновлено: уведомления каждому исполнителю лично,
+отслеживание user_id, бессрочные токены.
 """
 
 import os
@@ -42,6 +42,62 @@ logger = logging.getLogger("jarvis")
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🔵", "low": "⚪"}
 PRIORITY_LABEL = {"high": "КРИТИЧЕСКИЙ", "medium": "СТАНДАРТ", "low": "НИЗКИЙ"}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ОТСЛЕЖИВАНИЕ ПОЛЬЗОВАТЕЛЕЙ
+# ═══════════════════════════════════════════════════════════════
+
+def track_user_from_update(update: Update):
+    """Запоминаем каждого пользователя для отправки личных уведомлений."""
+    user = update.effective_user
+    if user:
+        db.track_user(
+            user_id=user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+            chat_id=update.effective_chat.id if update.effective_chat else 0
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ОТПРАВКА УВЕДОМЛЕНИЙ
+# ═══════════════════════════════════════════════════════════════
+
+async def notify_assignees(context, task, exclude_user_id=None, message=""):
+    """Отправляет уведомление всем исполнителям задачи в личку."""
+    user_ids = db.get_all_notifiable_users_for_task(task["id"])
+    for uid in user_ids:
+        if uid == exclude_user_id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=message,
+                parse_mode="Markdown"
+            )
+            logger.info(f"📩 Уведомление отправлено user_id={uid}")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось отправить user_id={uid}: {e}")
+
+
+async def notify_single_user(context, user_id=None, username="", message=""):
+    """Отправляет уведомление конкретному пользователю."""
+    target_id = user_id
+    if (not target_id or target_id == 0) and username:
+        target_id = db.get_user_id_by_username(username)
+    if not target_id:
+        return False
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=message,
+            parse_mode="Markdown"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось отправить user_id={target_id}: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -141,6 +197,7 @@ def project_btns(chat_id, task_id):
 # ═══════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     text = (
         "🤖 *J.A.R.V.I.S. v5 активирован!*\n\n"
         "Я ваш персональный ИИ-ассистент.\n\n"
@@ -162,9 +219,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     await cmd_start(update, context)
 
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     tasks = db.get_active_tasks(update.effective_chat.id)
     if not tasks:
         await update.message.reply_text("✨ Нет активных задач, сэр.")
@@ -178,6 +237,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     tasks = db.get_all_tasks(update.effective_chat.id)
     if not tasks:
         await update.message.reply_text("📭 Задач нет.")
@@ -192,6 +252,7 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     tasks = db.get_user_tasks(update.effective_chat.id, update.effective_user.id)
     if not tasks:
         await update.message.reply_text("✨ У вас нет назначенных задач.")
@@ -203,6 +264,7 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     if not context.args:
         await update.message.reply_text("Укажите номер: /done 1")
         return
@@ -214,10 +276,15 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = db.complete_task(task_id, update.effective_user.id, update.effective_chat.id)
     if task:
         await update.message.reply_text(f"✅ Задача *#{task_id}* выполнена!", parse_mode="Markdown")
+        # Уведомляем исполнителей
+        user_name = update.effective_user.first_name or "Кто-то"
+        await notify_assignees(context, task, exclude_user_id=update.effective_user.id,
+            message=f"✅ *{user_name}* выполнил задачу *#{task_id}*: {task['title']}")
     else:
         await update.message.reply_text("❌ Задача не найдена.")
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     if not context.args:
         await update.message.reply_text("Укажите номер: /delete 1")
         return
@@ -232,10 +299,12 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Задача не найдена.")
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     count = db.clear_done_tasks(update.effective_chat.id)
     await update.message.reply_text(f"🧹 Удалено выполненных задач: {count}")
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     if not context.args:
         await update.message.reply_text("Укажите запрос: /search отчёт")
         return
@@ -251,6 +320,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     stats = db.get_stats(update.effective_chat.id)
     if not stats:
         await update.message.reply_text("📊 Статистика пуста.")
@@ -266,6 +336,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     projects = db.get_projects(update.effective_chat.id)
     if not projects:
         await update.message.reply_text("📁 Нет проектов. Создайте: /newproject Название")
@@ -278,6 +349,7 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_newproject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     if not context.args:
         await update.message.reply_text("Укажите название: /newproject Маркетинг")
         return
@@ -292,12 +364,13 @@ async def cmd_newproject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     user = update.effective_user
     chat_id = update.effective_chat.id
     username = user.username or user.first_name or "Agent"
 
     token = db.generate_dashboard_token(
-        user_id=user.id, chat_id=chat_id, username=username, hours=72)
+        user_id=user.id, chat_id=chat_id, username=username, hours=876000)
 
     dashboard_url = os.environ.get(
         "DASHBOARD_URL", "https://worker-production-6faa.up.railway.app")
@@ -324,11 +397,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = q.data
     user = q.from_user
 
+    # Отслеживаем пользователя
+    db.track_user(user.id, user.username or "", user.first_name or "", q.message.chat_id)
+
     if d.startswith("done_"):
         tid = int(d.split("_")[1])
         task = db.complete_task(tid, user.id, q.message.chat_id)
         if task:
             await q.edit_message_text(f"✅ Задача *#{tid}* выполнена!\n\n{format_task(task)}", parse_mode="Markdown")
+            user_name = user.first_name or "Кто-то"
+            await notify_assignees(context, task, exclude_user_id=user.id,
+                message=f"✅ *{user_name}* выполнил задачу *#{tid}*: {task['title']}")
 
     elif d.startswith("del_"):
         tid = int(d.split("_")[1])
@@ -450,6 +529,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     processing = await update.message.reply_text("🎤 Обрабатываю голосовое сообщение...")
 
     try:
@@ -487,6 +567,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     text = update.message.text.strip()
     if not text:
         return
@@ -511,6 +592,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = update.effective_user.first_name or update.effective_user.username or "?"
         db.add_comment(tid, update.effective_user.id, name, text)
         await update.message.reply_text(f"💬 Комментарий добавлен к задаче *#{tid}*", parse_mode="Markdown")
+        # Уведомляем остальных
+        task = db.get_task(tid)
+        if task:
+            await notify_assignees(context, task, exclude_user_id=update.effective_user.id,
+                message=f"💬 *{name}* добавил комментарий к задаче *#{tid}*: {task['title']}\n\n_{text}_")
         return
 
     if context.user_data.get("await_tags"):
@@ -527,7 +613,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usernames = re.findall(r"@(\w+)", text)
         if usernames:
             for uname in usernames:
-                db.add_assignee(tid, 0, username=uname)
+                real_id = db.get_user_id_by_username(uname)
+                db.add_assignee(tid, real_id or 0, username=uname)
+                # Уведомляем назначенного в личку
+                task = db.get_task(tid)
+                creator_name = update.effective_user.first_name or "Кто-то"
+                await notify_single_user(context, user_id=real_id, username=uname,
+                    message=f"📩 *{creator_name}* назначил вам задачу *#{tid}*: {task['title']}\n\n"
+                            f"{format_task(task)}")
             await update.message.reply_text(
                 f"👤 Назначены: {', '.join('@'+u for u in usernames)} на задачу *#{tid}*",
                 parse_mode="Markdown")
@@ -570,21 +663,16 @@ async def _process_task_text(update, context, text, processing_msg):
     # Назначение @упомянутых
     mentioned = result.get("mentioned_usernames", [])
     for uname in mentioned:
-        db.add_assignee(task["id"], 0, username=uname)
+        real_id = db.get_user_id_by_username(uname)
+        db.add_assignee(task["id"], real_id or 0, username=uname)
+        # Уведомляем назначенного лично
+        await notify_single_user(context, user_id=real_id, username=uname,
+            message=f"📩 *{creator_name}* назначил вам задачу *#{task['id']}*: {task['title']}\n\n"
+                    f"{format_task(task)}")
 
     jarvis_msg = result.get("jarvis_response", "Задача создана, сэр.")
     response = f"🤖 {jarvis_msg}\n\n{format_task(task)}"
     await processing_msg.edit_text(response, parse_mode="Markdown", reply_markup=task_buttons(task["id"]))
-
-    # Уведомление назначенным в личку
-    for uname in mentioned:
-        try:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=f"📩 Вам назначена задача *#{task['id']}*: {task['title']}",
-                parse_mode="Markdown")
-        except Exception:
-            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -592,6 +680,7 @@ async def _process_task_text(update, context, text, processing_msg):
 # ═══════════════════════════════════════════════════════════════
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
     tid = context.user_data.get("await_file")
     msg = update.message
 
@@ -614,7 +703,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📎 Файл прикреплён к задаче *#{tid}*\n\n{format_task(t)}",
             parse_mode="Markdown", reply_markup=task_buttons(tid))
     elif msg.caption:
-        # Фото с подписью = новая задача
         processing = await msg.reply_text("⏳ Создаю задачу из фото...")
         result = extract_task_from_text(claude, msg.caption)
         if result and result.get("is_task"):
@@ -640,28 +728,60 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка дедлайнов каждые 60 сек — уведомления создателю + исполнителям лично."""
     reminders = db.get_tasks_needing_reminder()
 
     for task in reminders.get("upcoming", []):
         try:
             dl = datetime.fromisoformat(task["deadline"])
-            text = (f"⏰ *Напоминание, сэр!*\n\n"
-                    f"Задача *#{task['id']}* — {task['title']}\n"
-                    f"Дедлайн через 15 минут: {dl.strftime('%d.%m.%Y %H:%M')}\n\n"
-                    f"_Рекомендую приступить немедленно._")
-            await context.bot.send_message(chat_id=task["chat_id"], text=text, parse_mode="Markdown")
+            dl_str = dl.strftime("%d.%m.%Y %H:%M")
+            text = (
+                f"⏰ *Напоминание!*\n\n"
+                f"Задача *#{task['id']}* — {task['title']}\n"
+                f"Дедлайн через 15 минут: {dl_str}\n\n"
+                f"_Рекомендую приступить немедленно._"
+            )
+            # Отправляем в чат группы
+            try:
+                await context.bot.send_message(chat_id=task["chat_id"], text=text, parse_mode="Markdown")
+            except Exception:
+                pass
+            # Отправляем каждому причастному лично
+            user_ids = db.get_all_notifiable_users_for_task(task["id"])
+            for uid in user_ids:
+                try:
+                    if uid != task["chat_id"]:  # не дублируем если личный чат
+                        await context.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning(f"⚠️ Напоминание user_id={uid}: {e}")
             db.mark_reminded(task["id"], "15min")
+            logger.info(f"⏰ Напоминание 15мин: задача #{task['id']}")
         except Exception as e:
             logger.error(f"Ошибка напоминания: {e}")
 
     for task in reminders.get("overdue", []):
         try:
-            text = (f"🚨 *Внимание, сэр!*\n\n"
-                    f"Задача *#{task['id']}* — {task['title']}\n"
-                    f"*ПРОСРОЧЕНА!*\n\n"
-                    f"_Отметьте как выполненную (/done {task['id']}) или обновите дедлайн._")
-            await context.bot.send_message(chat_id=task["chat_id"], text=text, parse_mode="Markdown")
+            text = (
+                f"🚨 *Задача просрочена!*\n\n"
+                f"Задача *#{task['id']}* — {task['title']}\n"
+                f"*ДЕДЛАЙН ПРОШЁЛ!*\n\n"
+                f"_Выполните (/done {task['id']}) или обновите дедлайн._"
+            )
+            # Отправляем в чат группы
+            try:
+                await context.bot.send_message(chat_id=task["chat_id"], text=text, parse_mode="Markdown")
+            except Exception:
+                pass
+            # Отправляем каждому причастному лично
+            user_ids = db.get_all_notifiable_users_for_task(task["id"])
+            for uid in user_ids:
+                try:
+                    if uid != task["chat_id"]:
+                        await context.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning(f"⚠️ Напоминание user_id={uid}: {e}")
             db.mark_reminded(task["id"], "overdue")
+            logger.info(f"🚨 Просрочка: задача #{task['id']}")
         except Exception as e:
             logger.error(f"Ошибка напоминания: {e}")
 
@@ -680,7 +800,7 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE):
                      datetime.fromisoformat(t["deadline"]).date() == datetime.now().date()]
             high = [t for t in tasks if t.get("priority") == "high"]
 
-            lines = ["🌅 *Доброе утро, сэр! Утренний дайджест:*\n"]
+            lines = ["🌅 *Доброе утро! Утренний дайджест:*\n"]
             lines.append(f"📋 Активных задач: {len(tasks)}")
             if overdue:
                 lines.append(f"⚠️ Просроченных: {len(overdue)}")
@@ -693,7 +813,7 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"\n🔴 *Критичные ({len(high)}):*")
                 for t in high[:5]:
                     lines.append(f"  {t['title']}")
-            lines.append("\n_Хорошего дня, сэр!_")
+            lines.append("\n_Хорошего дня!_")
 
             await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
         except Exception as e:
@@ -705,7 +825,7 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    logger.info("🤖 J.A.R.V.I.S. v5 инициализация...")
+    logger.info("🤖 J.A.R.V.I.S. v5.1 инициализация...")
 
     db.init_db()
     logger.info("✅ База данных готова")
@@ -755,7 +875,7 @@ def main():
     from datetime import time as dt_time
     app.job_queue.run_daily(morning_digest, time=dt_time(hour=4, minute=0), name="digest")
 
-    logger.info("🚀 J.A.R.V.I.S. v5 запущен!")
+    logger.info("🚀 J.A.R.V.I.S. v5.1 запущен!")
     app.run_polling(drop_pending_updates=True)
 
 

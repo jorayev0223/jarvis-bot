@@ -1,7 +1,6 @@
 """
-J.A.R.V.I.S. v5 — Database
-Все таблицы: задачи, подзадачи, комментарии, проекты, назначения,
-файлы, статистика, токены дашборда, канбан.
+J.A.R.V.I.S. v5.1 — Database
+Добавлено: таблица known_users для отслеживания user_id по username.
 """
 
 import sqlite3
@@ -119,6 +118,61 @@ def init_db():
             expires_at TEXT NOT NULL,
             is_active INTEGER DEFAULT 1
         )""")
+
+        # Таблица для отслеживания пользователей (username → user_id)
+        conn.execute("""CREATE TABLE IF NOT EXISTS known_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            chat_id INTEGER DEFAULT 0,
+            last_seen TEXT NOT NULL
+        )""")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ОТСЛЕЖИВАНИЕ ПОЛЬЗОВАТЕЛЕЙ
+# ═══════════════════════════════════════════════════════════════
+
+def track_user(user_id, username="", first_name="", chat_id=0):
+    """Запоминает пользователя когда он пишет в чат."""
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        row = conn.execute("SELECT user_id FROM known_users WHERE user_id=?", (user_id,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE known_users SET username=?, first_name=?, chat_id=?, last_seen=? WHERE user_id=?",
+                (username, first_name, chat_id, now, user_id))
+        else:
+            conn.execute(
+                "INSERT INTO known_users (user_id, username, first_name, chat_id, last_seen) VALUES (?,?,?,?,?)",
+                (user_id, username, first_name, chat_id, now))
+
+def get_user_id_by_username(username):
+    """Находит user_id по username."""
+    username = username.lstrip("@").lower()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM known_users WHERE LOWER(username)=?", (username,)).fetchone()
+        return row["user_id"] if row else None
+
+def get_all_notifiable_users_for_task(task_id):
+    """Возвращает список user_id для уведомлений: создатель + все исполнители."""
+    with get_connection() as conn:
+        task = conn.execute("SELECT creator_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            return []
+        user_ids = set()
+        user_ids.add(task["creator_id"])
+        assignees = conn.execute(
+            "SELECT user_id, username FROM task_assignees WHERE task_id=?", (task_id,)).fetchall()
+        for a in assignees:
+            if a["user_id"] and a["user_id"] != 0:
+                user_ids.add(a["user_id"])
+            elif a["username"]:
+                uid = get_user_id_by_username(a["username"])
+                if uid:
+                    user_ids.add(uid)
+        return list(user_ids)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -299,10 +353,15 @@ def postpone_task(task_id, user_id, delta):
 
 def add_assignee(task_id, user_id, username="", first_name=""):
     now = datetime.now().isoformat()
+    # Если user_id=0 но есть username, пробуем найти реальный user_id
+    if (not user_id or user_id == 0) and username:
+        real_id = get_user_id_by_username(username)
+        if real_id:
+            user_id = real_id
     with get_connection() as conn:
         exists = conn.execute(
-            "SELECT id FROM task_assignees WHERE task_id=? AND user_id=?",
-            (task_id, user_id)).fetchone()
+            "SELECT id FROM task_assignees WHERE task_id=? AND (user_id=? OR LOWER(username)=LOWER(?))",
+            (task_id, user_id, username)).fetchone()
         if exists:
             return False
         conn.execute(
@@ -580,7 +639,6 @@ def get_dashboard_stats(user_id, chat_id=None):
         if chat_id and chat_id != 0:
             base_where += " AND (chat_id=? OR chat_id=0)"
             params.append(chat_id)
-
         total = conn.execute(f"SELECT COUNT(*) FROM tasks {base_where}", params).fetchone()[0]
         active = conn.execute(
             f"SELECT COUNT(*) FROM tasks {base_where} AND status='active'", params).fetchone()[0]
