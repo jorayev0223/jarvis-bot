@@ -60,6 +60,25 @@ def track_user_from_update(update: Update):
         )
 
 
+async def check_access(update: Update) -> bool:
+    """Проверяет доступ. Возвращает True если доступ есть."""
+    user = update.effective_user
+    user_id = user.id if user else 0
+    username = user.username or "" if user else ""
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    if db.check_access(user_id, chat_id, username):
+        return True
+    # Нет доступа — отправляем отказ
+    try:
+        await update.effective_message.reply_text(
+            "🔒 *Доступ запрещён*\n\n"
+            "Этот бот приватный. Обратитесь к администратору для получения доступа.",
+            parse_mode="Markdown")
+    except Exception:
+        pass
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════
 #  ОТПРАВКА УВЕДОМЛЕНИЙ
 # ═══════════════════════════════════════════════════════════════
@@ -198,6 +217,8 @@ def project_btns(chat_id, task_id):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update):
+        return
     text = (
         "🤖 *J.A.R.V.I.S. v5 активирован!*\n\n"
         "Я ваш персональный ИИ-ассистент.\n\n"
@@ -216,14 +237,142 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/dashboard — веб-дашборд\n"
         "/help — помощь"
     )
+    # Если админ — показываем ещё админ-команды
+    if db.is_admin(update.effective_user.id):
+        text += (
+            "\n\n🔐 *Админ-команды:*\n"
+            "/adduser @username — дать доступ\n"
+            "/removeuser @username — забрать доступ\n"
+            "/users — список пользователей\n"
+            "/addchat — разрешить эту группу\n"
+            "/removechat — запретить эту группу\n"
+            "/myid — узнать свой ID"
+        )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update):
+        return
     await cmd_start(update, context)
+
+# ─── Админ-команды ────────────────────────────────────────────
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает user_id и chat_id — полезно для настройки ADMIN_IDS."""
+    track_user_from_update(update)
+    user = update.effective_user
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"👤 Ваш user\\_id: `{user.id}`\n"
+        f"💬 chat\\_id: `{chat.id}`\n"
+        f"📛 username: @{user.username or '—'}",
+        parse_mode="Markdown")
+
+async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Только для администраторов.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Укажите @username или user\\_id:\n"
+            "/adduser @username\n/adduser 123456789",
+            parse_mode="Markdown")
+        return
+    arg = context.args[0]
+    if arg.startswith("@"):
+        username = arg[1:]
+        real_id = db.get_user_id_by_username(username)
+        if real_id:
+            db.add_allowed_user(real_id, username=username, added_by=update.effective_user.id)
+            await update.message.reply_text(
+                f"✅ Пользователь @{username} (ID: `{real_id}`) добавлен!", parse_mode="Markdown")
+        else:
+            db.add_allowed_user(0, username=username, added_by=update.effective_user.id)
+            await update.message.reply_text(
+                f"⚠️ @{username} ещё не писал боту, поэтому ID неизвестен.\n"
+                f"Пользователь добавлен по username. Когда он напишет /start, бот его узнает.\n\n"
+                f"Или укажите user\\_id напрямую: /adduser 123456789",
+                parse_mode="Markdown")
+    else:
+        try:
+            uid = int(arg)
+            db.add_allowed_user(uid, added_by=update.effective_user.id)
+            await update.message.reply_text(f"✅ Пользователь ID `{uid}` добавлен!", parse_mode="Markdown")
+        except ValueError:
+            await update.message.reply_text("Укажите @username или числовой user\\_id.", parse_mode="Markdown")
+
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Только для администраторов.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажите @username или user\\_id: /removeuser @username", parse_mode="Markdown")
+        return
+    arg = context.args[0]
+    if arg.startswith("@"):
+        uid = db.get_user_id_by_username(arg[1:])
+        if uid:
+            db.remove_allowed_user(uid)
+            await update.message.reply_text(f"🗑 Доступ @{arg[1:]} отозван.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Пользователь не найден.")
+    else:
+        try:
+            uid = int(arg)
+            db.remove_allowed_user(uid)
+            await update.message.reply_text(f"🗑 Доступ ID `{uid}` отозван.", parse_mode="Markdown")
+        except ValueError:
+            await update.message.reply_text("Укажите @username или user\\_id.", parse_mode="Markdown")
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Только для администраторов.")
+        return
+    users = db.get_allowed_users()
+    chats = db.get_allowed_chats()
+    lines = ["🔐 *Управление доступом:*\n"]
+    lines.append(f"*Пользователи ({len(users)}):*")
+    if users:
+        for u in users:
+            name = f"@{u['username']}" if u.get('username') else f"ID: {u['user_id']}"
+            lines.append(f"  ✅ {name}")
+    else:
+        lines.append("  _Список пуст_")
+    lines.append(f"\n*Группы ({len(chats)}):*")
+    if chats:
+        for c in chats:
+            lines.append(f"  ✅ {c.get('chat_title') or c['chat_id']}")
+    else:
+        lines.append("  _Список пуст_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Только для администраторов.")
+        return
+    chat = update.effective_chat
+    db.add_allowed_chat(chat.id, chat.title or "Личный чат", update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ Чат *{chat.title or 'Личный чат'}* (ID: `{chat.id}`) разрешён!",
+        parse_mode="Markdown")
+
+async def cmd_removechat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user_from_update(update)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Только для администраторов.")
+        return
+    chat = update.effective_chat
+    db.remove_allowed_chat(chat.id)
+    await update.message.reply_text(f"🗑 Чат `{chat.id}` удалён из разрешённых.", parse_mode="Markdown")
 
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     tasks = db.get_active_tasks(update.effective_chat.id)
     if not tasks:
         await update.message.reply_text("✨ Нет активных задач, сэр.")
@@ -238,6 +387,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     tasks = db.get_all_tasks(update.effective_chat.id)
     if not tasks:
         await update.message.reply_text("📭 Задач нет.")
@@ -253,6 +403,7 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     tasks = db.get_user_tasks(update.effective_chat.id, update.effective_user.id)
     if not tasks:
         await update.message.reply_text("✨ У вас нет назначенных задач.")
@@ -265,6 +416,7 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     if not context.args:
         await update.message.reply_text("Укажите номер: /done 1")
         return
@@ -285,6 +437,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     if not context.args:
         await update.message.reply_text("Укажите номер: /delete 1")
         return
@@ -300,11 +453,13 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     count = db.clear_done_tasks(update.effective_chat.id)
     await update.message.reply_text(f"🧹 Удалено выполненных задач: {count}")
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     if not context.args:
         await update.message.reply_text("Укажите запрос: /search отчёт")
         return
@@ -321,6 +476,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     stats = db.get_stats(update.effective_chat.id)
     if not stats:
         await update.message.reply_text("📊 Статистика пуста.")
@@ -337,6 +493,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     projects = db.get_projects(update.effective_chat.id)
     if not projects:
         await update.message.reply_text("📁 Нет проектов. Создайте: /newproject Название")
@@ -350,6 +507,7 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_newproject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     if not context.args:
         await update.message.reply_text("Укажите название: /newproject Маркетинг")
         return
@@ -365,6 +523,7 @@ async def cmd_newproject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     user = update.effective_user
     chat_id = update.effective_chat.id
     username = user.username or user.first_name or "Agent"
@@ -399,6 +558,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Отслеживаем пользователя
     db.track_user(user.id, user.username or "", user.first_name or "", q.message.chat_id)
+
+    # Проверка доступа
+    if not db.check_access(user.id, q.message.chat_id, user.username or ""):
+        return
 
     if d.startswith("done_"):
         tid = int(d.split("_")[1])
@@ -530,6 +693,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     processing = await update.message.reply_text("🎤 Обрабатываю голосовое сообщение...")
 
     try:
@@ -568,6 +732,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     text = update.message.text.strip()
     if not text:
         return
@@ -681,6 +846,7 @@ async def _process_task_text(update, context, text, processing_msg):
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
+    if not await check_access(update): return
     tid = context.user_data.get("await_file")
     msg = update.message
 
@@ -855,6 +1021,14 @@ def main():
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("newproject", cmd_newproject))
     app.add_handler(CommandHandler("dashboard", cmd_dashboard))
+
+    # Админ-команды
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("addchat", cmd_addchat))
+    app.add_handler(CommandHandler("removechat", cmd_removechat))
 
     # Кнопки
     app.add_handler(CallbackQueryHandler(handle_callback))

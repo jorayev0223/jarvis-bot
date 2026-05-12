@@ -128,6 +128,23 @@ def init_db():
             last_seen TEXT NOT NULL
         )""")
 
+        # Таблица разрешённых пользователей (приватный бот)
+        conn.execute("""CREATE TABLE IF NOT EXISTS allowed_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            added_by INTEGER DEFAULT 0,
+            added_at TEXT NOT NULL
+        )""")
+
+        # Таблица разрешённых чатов/групп
+        conn.execute("""CREATE TABLE IF NOT EXISTS allowed_chats (
+            chat_id INTEGER PRIMARY KEY,
+            chat_title TEXT DEFAULT '',
+            added_by INTEGER DEFAULT 0,
+            added_at TEXT NOT NULL
+        )""")
+
 
 # ═══════════════════════════════════════════════════════════════
 #  ОТСЛЕЖИВАНИЕ ПОЛЬЗОВАТЕЛЕЙ
@@ -173,6 +190,90 @@ def get_all_notifiable_users_for_task(task_id):
                 if uid:
                     user_ids.add(uid)
         return list(user_ids)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  КОНТРОЛЬ ДОСТУПА (ПРИВАТНЫЙ БОТ)
+# ═══════════════════════════════════════════════════════════════
+
+def is_admin(user_id):
+    """Проверяет, является ли пользователь администратором."""
+    admin_ids_str = os.environ.get("ADMIN_IDS", "")
+    if not admin_ids_str:
+        return False
+    admin_ids = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()]
+    return user_id in admin_ids
+
+def add_allowed_user(user_id, username="", first_name="", added_by=0):
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO allowed_users (user_id, username, first_name, added_by, added_at)
+               VALUES (?,?,?,?,?)""",
+            (user_id, username, first_name, added_by, now))
+
+def remove_allowed_user(user_id):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM allowed_users WHERE user_id=?", (user_id,))
+
+def is_user_allowed(user_id, username=""):
+    """Проверяет, есть ли пользователь в списке разрешённых (или он админ)."""
+    if is_admin(user_id):
+        return True
+    with get_connection() as conn:
+        row = conn.execute("SELECT user_id FROM allowed_users WHERE user_id=?", (user_id,)).fetchone()
+        if row:
+            return True
+        # Проверяем по username (если добавлен по @username без user_id)
+        if username:
+            row = conn.execute(
+                "SELECT user_id FROM allowed_users WHERE LOWER(username)=LOWER(?)",
+                (username,)).fetchone()
+            if row:
+                # Обновляем user_id в записи
+                conn.execute("UPDATE allowed_users SET user_id=? WHERE LOWER(username)=LOWER(?)",
+                             (user_id, username))
+                return True
+    return False
+
+def get_allowed_users():
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM allowed_users ORDER BY added_at DESC").fetchall()]
+
+def add_allowed_chat(chat_id, chat_title="", added_by=0):
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO allowed_chats (chat_id, chat_title, added_by, added_at)
+               VALUES (?,?,?,?)""",
+            (chat_id, chat_title, added_by, now))
+
+def remove_allowed_chat(chat_id):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM allowed_chats WHERE chat_id=?", (chat_id,))
+
+def is_chat_allowed(chat_id):
+    """Проверяет, разрешён ли чат/группа."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT chat_id FROM allowed_chats WHERE chat_id=?", (chat_id,)).fetchone()
+        return row is not None
+
+def get_allowed_chats():
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM allowed_chats ORDER BY added_at DESC").fetchall()]
+
+def check_access(user_id, chat_id, username=""):
+    """Главная проверка: пользователь имеет доступ?
+    Доступ есть если: админ, или в списке allowed_users, или чат в allowed_chats."""
+    if is_admin(user_id):
+        return True
+    if is_user_allowed(user_id, username):
+        return True
+    if is_chat_allowed(chat_id):
+        return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════
