@@ -1,11 +1,12 @@
 """
-J.A.R.V.I.S. v5.1 — Database
-Добавлено: таблица known_users для отслеживания user_id по username.
+J.A.R.V.I.S. v5.3 — Database
+Stage 1: архив, хронология, веб-хуки (Zapier/Make), ключи задач (JV-1), настройки.
 """
 
 import sqlite3
 import os
 import secrets
+import json
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
@@ -144,6 +145,45 @@ def init_db():
             added_by INTEGER DEFAULT 0,
             added_at TEXT NOT NULL
         )""")
+
+        # Настройки чата (ключ задач, авто-архив и т.д.)
+        conn.execute("""CREATE TABLE IF NOT EXISTS chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            key_prefix TEXT DEFAULT 'JV',
+            auto_archive_days INTEGER DEFAULT 7,
+            timezone_offset INTEGER DEFAULT 5,
+            settings_json TEXT DEFAULT '{}'
+        )""")
+
+        # Веб-хуки для Zapier / Make.com / любых внешних сервисов
+        conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            events TEXT NOT NULL DEFAULT 'task.created,task.completed',
+            is_active INTEGER DEFAULT 1,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            last_triggered_at TEXT DEFAULT NULL,
+            trigger_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            last_error TEXT DEFAULT ''
+        )""")
+
+        # Миграции колонок задач — добавляем безопасно, не падая если уже есть
+        _migrate_column(conn, "tasks", "archived_at", "TEXT DEFAULT NULL")
+        _migrate_column(conn, "tasks", "start_date", "TEXT DEFAULT NULL")
+        _migrate_column(conn, "tasks", "task_type", "TEXT DEFAULT 'task'")
+        _migrate_column(conn, "tasks", "parent_id", "INTEGER DEFAULT NULL")
+
+
+def _migrate_column(conn, table, column, definition):
+    """Безопасно добавляет колонку в таблицу. Игнорирует ошибку если колонка уже есть."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    except sqlite3.OperationalError:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -341,12 +381,14 @@ def get_active_tasks(chat_id, project_id=None):
         if project_id:
             rows = conn.execute(
                 """SELECT * FROM tasks WHERE chat_id=? AND status='active' AND project_id=?
+                   AND archived_at IS NULL
                    ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
                    CASE WHEN deadline IS NOT NULL THEN 0 ELSE 1 END, deadline ASC""",
                 (chat_id, project_id)).fetchall()
         else:
             rows = conn.execute(
                 """SELECT * FROM tasks WHERE chat_id=? AND status='active'
+                   AND archived_at IS NULL
                    ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
                    CASE WHEN deadline IS NOT NULL THEN 0 ELSE 1 END, deadline ASC""",
                 (chat_id,)).fetchall()
@@ -355,7 +397,8 @@ def get_active_tasks(chat_id, project_id=None):
 def get_all_tasks(chat_id):
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE chat_id=? ORDER BY status ASC, created_at DESC",
+            """SELECT * FROM tasks WHERE chat_id=? AND archived_at IS NULL
+               ORDER BY status ASC, created_at DESC""",
             (chat_id,)).fetchall()
         return [_enrich(conn, r) for r in rows]
 
@@ -667,10 +710,12 @@ def revoke_token(token):
 #  ДАШБОРД — CRUD
 # ═══════════════════════════════════════════════════════════════
 
-def get_tasks_for_dashboard(user_id, chat_id=None, status=None):
+def get_tasks_for_dashboard(user_id, chat_id=None, status=None, include_archived=False):
     with get_connection() as conn:
         query = "SELECT * FROM tasks WHERE (creator_id=? OR id IN (SELECT task_id FROM task_assignees WHERE user_id=?))"
         params = [user_id, user_id]
+        if not include_archived:
+            query += " AND archived_at IS NULL"
         if chat_id and chat_id != 0:
             query += " AND (chat_id=? OR chat_id=0)"
             params.append(chat_id)
@@ -757,3 +802,224 @@ def get_dashboard_stats(user_id, chat_id=None):
             "overdue": overdue, "high_priority": high,
             "completion_rate": round(done / total * 100, 1) if total > 0 else 0
         }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  НАСТРОЙКИ ЧАТА
+# ═══════════════════════════════════════════════════════════════
+
+def get_chat_settings(chat_id):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM chat_settings WHERE chat_id=?", (chat_id,)).fetchone()
+        if row:
+            d = dict(row)
+            try:
+                d["settings_json"] = json.loads(d.get("settings_json") or "{}")
+            except Exception:
+                d["settings_json"] = {}
+            return d
+        # Создаём дефолтные настройки
+        conn.execute(
+            "INSERT INTO chat_settings (chat_id, key_prefix, auto_archive_days, timezone_offset) VALUES (?,?,?,?)",
+            (chat_id, "JV", 7, 5))
+        return {"chat_id": chat_id, "key_prefix": "JV", "auto_archive_days": 7,
+                "timezone_offset": 5, "settings_json": {}}
+
+
+def update_chat_settings(chat_id, **fields):
+    allowed = {"key_prefix", "auto_archive_days", "timezone_offset"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    # Убедимся что запись существует
+    get_chat_settings(chat_id)
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [chat_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE chat_settings SET {set_clause} WHERE chat_id=?", values)
+    return True
+
+
+def get_task_key(task_id, chat_id):
+    """Возвращает строку вида JV-123."""
+    settings = get_chat_settings(chat_id)
+    return f"{settings['key_prefix']}-{task_id}"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  АРХИВ
+# ═══════════════════════════════════════════════════════════════
+
+def archive_task(task_id, user_id):
+    """Архивирует задачу — не удаляет, но скрывает из основных списков."""
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET archived_at=? WHERE id=?", (now, task_id))
+    return True
+
+
+def restore_task(task_id):
+    """Восстанавливает задачу из архива."""
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET archived_at=NULL WHERE id=?", (task_id,))
+    return True
+
+
+def get_archived_tasks(chat_id):
+    """Список архивных задач чата."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM tasks WHERE chat_id=? AND archived_at IS NOT NULL
+               ORDER BY archived_at DESC""", (chat_id,)).fetchall()
+        return [_enrich(conn, r) for r in rows]
+
+
+def auto_archive_old_done(chat_id=None):
+    """Автоматически архивирует выполненные задачи старше N дней."""
+    if chat_id:
+        settings = get_chat_settings(chat_id)
+        days = settings.get("auto_archive_days", 7)
+        chats = [(chat_id, days)]
+    else:
+        with get_connection() as conn:
+            rows = conn.execute("SELECT chat_id, auto_archive_days FROM chat_settings").fetchall()
+            chats = [(r["chat_id"], r["auto_archive_days"]) for r in rows]
+    
+    total = 0
+    for cid, days in chats:
+        if days <= 0:
+            continue
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with get_connection() as conn:
+            result = conn.execute(
+                """UPDATE tasks SET archived_at=? 
+                   WHERE chat_id=? AND status='done' 
+                   AND completed_at IS NOT NULL AND completed_at<?
+                   AND archived_at IS NULL""",
+                (datetime.now().isoformat(), cid, cutoff))
+            total += result.rowcount
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ВЕБ-ХУКИ (Zapier / Make.com / любые URL)
+# ═══════════════════════════════════════════════════════════════
+
+WEBHOOK_EVENTS = [
+    "task.created", "task.updated", "task.completed", "task.deleted",
+    "task.archived", "comment.added", "assignee.added", "subtask.added"
+]
+
+
+def create_webhook(chat_id, name, url, events, user_id):
+    """Создаёт веб-хук. events — список или строка через запятую."""
+    if isinstance(events, list):
+        events = ",".join(events)
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO webhooks (chat_id, name, url, events, created_by, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (chat_id, name, url, events, user_id, now))
+        return cur.lastrowid
+
+
+def get_webhooks(chat_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM webhooks WHERE chat_id=? ORDER BY created_at DESC",
+            (chat_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_active_webhooks_for_event(chat_id, event):
+    """Возвращает активные веб-хуки которые подписаны на это событие."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM webhooks WHERE chat_id=? AND is_active=1
+               AND (events LIKE ? OR events LIKE ? OR events='*')""",
+            (chat_id, f"%{event}%", f"%*%")).fetchall()
+        return [dict(r) for r in rows if event in (r["events"] or "") or r["events"] == "*"]
+
+
+def update_webhook(webhook_id, **fields):
+    allowed = {"name", "url", "events", "is_active"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if "events" in updates and isinstance(updates["events"], list):
+        updates["events"] = ",".join(updates["events"])
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [webhook_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE webhooks SET {set_clause} WHERE id=?", values)
+    return True
+
+
+def delete_webhook(webhook_id):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM webhooks WHERE id=?", (webhook_id,))
+    return True
+
+
+def log_webhook_trigger(webhook_id, success=True, error=""):
+    """Логирует факт срабатывания веб-хука."""
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        if success:
+            conn.execute(
+                """UPDATE webhooks SET last_triggered_at=?, trigger_count=trigger_count+1
+                   WHERE id=?""", (now, webhook_id))
+        else:
+            conn.execute(
+                """UPDATE webhooks SET error_count=error_count+1, last_error=?
+                   WHERE id=?""", (error[:500], webhook_id))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ОБНОВЛЁННЫЙ ПОИСК С ФИЛЬТРАМИ И СОРТИРОВКОЙ
+# ═══════════════════════════════════════════════════════════════
+
+def get_tasks_filtered(chat_id, filters=None, sort_by="created_at", sort_dir="desc",
+                       include_archived=False, limit=500):
+    """Универсальный поиск задач с фильтрами.
+    filters: dict — может содержать: status, priority, category, assignee_id, search, project_id, type
+    """
+    filters = filters or {}
+    where = ["chat_id=?"]
+    params = [chat_id]
+    
+    if not include_archived:
+        where.append("archived_at IS NULL")
+    
+    if filters.get("status"):
+        where.append("status=?")
+        params.append(filters["status"])
+    if filters.get("priority"):
+        where.append("priority=?")
+        params.append(filters["priority"])
+    if filters.get("category"):
+        where.append("category=?")
+        params.append(filters["category"])
+    if filters.get("project_id"):
+        where.append("project_id=?")
+        params.append(filters["project_id"])
+    if filters.get("type"):
+        where.append("task_type=?")
+        params.append(filters["type"])
+    if filters.get("search"):
+        q = f"%{filters['search']}%"
+        where.append("(title LIKE ? OR description LIKE ? OR tags LIKE ?)")
+        params.extend([q, q, q])
+    
+    valid_sort = {"created_at", "deadline", "priority", "title", "status", "id"}
+    if sort_by not in valid_sort:
+        sort_by = "created_at"
+    sort_dir = "DESC" if sort_dir.lower() == "desc" else "ASC"
+    
+    query = f"SELECT * FROM tasks WHERE {' AND '.join(where)} ORDER BY {sort_by} {sort_dir} LIMIT ?"
+    params.append(limit)
+    
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_enrich(conn, r) for r in rows]
