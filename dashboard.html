@@ -3264,6 +3264,16 @@ input, textarea, select { font-family: inherit; }
           </select>
         </div>
       </div>
+      <div class="form-group">
+        <label class="form-label">Проект</label>
+        <select class="form-select" id="fProject">
+          <option value="">— Без проекта —</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Исполнители</label>
+        <div class="tp-assignees" id="fAssigneesContainer" style="padding:8px 0;"></div>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-danger" id="btnDelete" style="display:none" onclick="deleteCurrentTask()">Удалить</button>
@@ -3882,9 +3892,118 @@ function openTaskModal(id = null) {
   document.getElementById('fCategory').value = '';
   if (!selectedDay) document.getElementById('fDeadline').value = '';
   document.getElementById('fColumn').value = 'todo';
+  document.getElementById('fProject').value = '';
+  pendingAssignees = [];
+  renderPendingAssignees();
+  loadProjectsForModal();
   btnDel.style.display = 'none';
   modal.classList.add('active');
   setTimeout(() => document.getElementById('fTitle').focus(), 100);
+}
+
+let pendingAssignees = [];
+
+async function loadProjectsForModal() {
+  try {
+    const data = await api('/projects');
+    const select = document.getElementById('fProject');
+    const cur = select.value;
+    select.innerHTML = '<option value="">— Без проекта —</option>';
+    (data.projects || []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = `${p.emoji || '📁'} ${p.name}`;
+      select.appendChild(opt);
+    });
+    if (cur) select.value = cur;
+  } catch (e) {}
+}
+
+function renderPendingAssignees() {
+  const container = document.getElementById('fAssigneesContainer');
+  let html = '';
+  pendingAssignees.forEach((a, idx) => {
+    const name = a.first_name || a.username || ('User #' + a.user_id);
+    const initial = (name || 'U').charAt(0).toUpperCase();
+    html += `
+      <div class="tp-assignee-chip">
+        <div class="tp-mini-avatar">${initial}</div>
+        <span>${a.username ? '@' + esc(a.username) : esc(name)}</span>
+        <button class="tp-assignee-remove" onclick="removePendingAssignee(${idx})" title="Убрать">×</button>
+      </div>`;
+  });
+  html += `<button class="tp-add-btn" onclick="openModalAssigneePicker()">+ Добавить</button>`;
+  container.innerHTML = html;
+}
+
+function removePendingAssignee(idx) {
+  pendingAssignees.splice(idx, 1);
+  renderPendingAssignees();
+}
+
+let isModalAssigneePicker = false;
+
+function openModalAssigneePicker() {
+  isModalAssigneePicker = true;
+  document.getElementById('assigneePicker').classList.add('active');
+  document.getElementById('assigneeSearchInput').value = '';
+  document.getElementById('manualAssignee').value = '';
+  searchAssigneesForModal();
+  setTimeout(() => document.getElementById('assigneeSearchInput').focus(), 100);
+}
+
+async function searchAssigneesForModal() {
+  const q = document.getElementById('assigneeSearchInput').value.trim();
+  try {
+    const data = await api(`/users/search?q=${encodeURIComponent(q)}`);
+    const list = document.getElementById('assigneeList');
+    if (!data.users || !data.users.length) {
+      list.innerHTML = `<div class="tp-picker-empty">Никого не найдено.<br>Введите @username вручную ниже.</div>`;
+      return;
+    }
+    list.innerHTML = data.users.map(u => {
+      const name = u.first_name || u.username || 'User';
+      const initial = name.charAt(0).toUpperCase();
+      const action = isModalAssigneePicker
+        ? `addPendingAssignee(${u.user_id}, '${esc(u.username||'')}', '${esc(u.first_name||'')}')`
+        : `addAssignee(${u.user_id}, '${esc(u.username||'')}', '${esc(u.first_name||'')}')`;
+      return `
+        <div class="tp-picker-item" onclick="${action}">
+          <div class="tp-mini-avatar">${initial}</div>
+          <div style="flex:1;min-width:0;">
+            <div>${esc(name)}</div>
+            ${u.username ? `<div style="font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono);">@${esc(u.username)}</div>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('assigneeList').innerHTML = `<div class="tp-picker-empty">Ошибка загрузки</div>`;
+  }
+}
+
+function addPendingAssignee(userId, username, firstName) {
+  // Проверяем что ещё не добавлен
+  if (pendingAssignees.some(a => a.user_id === userId || (username && a.username === username))) {
+    toast('Уже добавлен', 'error');
+    return;
+  }
+  pendingAssignees.push({ user_id: userId, username, first_name: firstName });
+  renderPendingAssignees();
+  closeAssigneePicker();
+}
+
+function addPendingAssigneeManual() {
+  const input = document.getElementById('manualAssignee');
+  const username = input.value.trim().replace(/^@/, '');
+  if (!username) return;
+  if (pendingAssignees.some(a => a.username === username)) {
+    toast('Уже добавлен', 'error');
+    return;
+  }
+  pendingAssignees.push({ user_id: 0, username, first_name: '' });
+  renderPendingAssignees();
+  input.value = '';
+  closeAssigneePicker();
 }
 
 /* ─── TASK DETAIL PANEL ─── */
@@ -4005,6 +4124,7 @@ async function removeAssignee(assigneeId) {
 }
 
 function openAssigneePicker() {
+  isModalAssigneePicker = false;
   document.getElementById('assigneePicker').classList.add('active');
   document.getElementById('assigneeSearchInput').value = '';
   document.getElementById('manualAssignee').value = '';
@@ -4014,9 +4134,14 @@ function openAssigneePicker() {
 
 function closeAssigneePicker() {
   document.getElementById('assigneePicker').classList.remove('active');
+  isModalAssigneePicker = false;
 }
 
 async function searchAssignees() {
+  // Если открыто из модалки новой задачи — используем pending flow
+  if (isModalAssigneePicker) {
+    return searchAssigneesForModal();
+  }
   const q = document.getElementById('assigneeSearchInput').value.trim();
   try {
     const data = await api(`/users/search?q=${encodeURIComponent(q)}`);
@@ -4057,6 +4182,10 @@ async function addAssignee(userId, username, firstName) {
 }
 
 async function addAssigneeManual() {
+  // Если открыто из модалки — добавляем в pending
+  if (isModalAssigneePicker) {
+    return addPendingAssigneeManual();
+  }
   const input = document.getElementById('manualAssignee');
   const username = input.value.trim().replace(/^@/, '');
   if (!username) return;
@@ -4213,20 +4342,38 @@ async function saveTask() {
   const id = document.getElementById('editTaskId').value;
   const title = document.getElementById('fTitle').value.trim();
   if (!title) { toast('Введите название', 'error'); return; }
+  const projectId = document.getElementById('fProject').value;
   const body = {
     title,
     description: document.getElementById('fDesc').value.trim(),
     priority: document.getElementById('fPriority').value,
     category: document.getElementById('fCategory').value.trim(),
     deadline: document.getElementById('fDeadline').value || null,
-    kanban_column: document.getElementById('fColumn').value
+    kanban_column: document.getElementById('fColumn').value,
+    project_id: projectId ? parseInt(projectId) : null
   };
   try {
     if (id) {
       await api(`/tasks/${id}`, { method: 'PUT', body: JSON.stringify(body) });
       toast('Задача обновлена', 'success');
     } else {
-      await api('/tasks', { method: 'POST', body: JSON.stringify(body) });
+      const result = await api('/tasks', { method: 'POST', body: JSON.stringify(body) });
+      // Назначаем исполнителей после создания задачи
+      if (result && result.task_id && pendingAssignees.length) {
+        for (const a of pendingAssignees) {
+          try {
+            await api(`/tasks/${result.task_id}/assignees`, {
+              method: 'POST',
+              body: JSON.stringify({
+                user_id: a.user_id,
+                username: a.username,
+                first_name: a.first_name
+              })
+            });
+          } catch (e) { console.warn('Ошибка назначения', a, e); }
+        }
+        pendingAssignees = [];
+      }
       toast('Задача создана', 'success');
     }
     closeTaskModal();
