@@ -2944,9 +2944,56 @@ input, textarea, select { font-family: inherit; }
         </div>
       </div>
 
-      <!-- ALL TASKS VIEW -->
+      <!-- ALL TASKS VIEW (Jira-style table) -->
       <div class="view" id="view-all">
-        <div class="list-view" id="allContent"></div>
+        <div class="table-view">
+          <div class="table-toolbar">
+            <div class="table-filters">
+              <select class="btn-secondary" id="tFilterStatus" onchange="renderTable()" style="cursor:pointer;">
+                <option value="">Все статусы</option>
+                <option value="active">Активные</option>
+                <option value="done">Готовые</option>
+              </select>
+              <select class="btn-secondary" id="tFilterPriority" onchange="renderTable()" style="cursor:pointer;">
+                <option value="">Все приоритеты</option>
+                <option value="high">🔴 Критические</option>
+                <option value="medium">🔵 Средние</option>
+                <option value="low">⚪ Низкие</option>
+              </select>
+              <select class="btn-secondary" id="tFilterProject" onchange="renderTable()" style="cursor:pointer;">
+                <option value="">Все проекты</option>
+              </select>
+              <select class="btn-secondary" id="tGroupBy" onchange="renderTable()" style="cursor:pointer;">
+                <option value="">Без группировки</option>
+                <option value="status">Группа: Статус</option>
+                <option value="priority">Группа: Приоритет</option>
+                <option value="project">Группа: Проект</option>
+                <option value="category">Группа: Категория</option>
+              </select>
+            </div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-tertiary);">
+              <span id="tCount">0</span> задач
+            </div>
+          </div>
+          <table class="task-table" id="taskTable">
+            <thead>
+              <tr id="taskTableHead">
+                <th data-sort="task_type" style="width:30px;text-align:center;">⌘</th>
+                <th data-sort="id">Ключ</th>
+                <th data-sort="title">Тема</th>
+                <th data-sort="status">Статус</th>
+                <th style="width:36px;text-align:center;">💬</th>
+                <th data-sort="category">Категория</th>
+                <th>Исполнитель</th>
+                <th data-sort="deadline">Дедлайн</th>
+                <th data-sort="priority">Приоритет</th>
+                <th>Метки</th>
+                <th data-sort="created_at">Создано</th>
+              </tr>
+            </thead>
+            <tbody id="taskTableBody"></tbody>
+          </table>
+        </div>
       </div>
 
       <!-- TIMELINE (GANTT) VIEW -->
@@ -3600,36 +3647,201 @@ function renderUpcoming() {
 /* ─── ALL VIEW ─── */
 
 function renderAll() {
-  const container = document.getElementById('allContent');
-  const tasks = allTasks.filter(searchMatches);
+  renderTable();
+}
+
+let tableSortBy = 'created_at';
+let tableSortDir = 'desc';
+let projectsCache = [];
+
+async function loadProjectsForTable() {
+  try {
+    const data = await api('/projects');
+    projectsCache = data.projects || [];
+    const sel = document.getElementById('tFilterProject');
+    if (sel) {
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">Все проекты</option>';
+      projectsCache.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = `${p.emoji || '📁'} ${p.name}`;
+        sel.appendChild(opt);
+      });
+      if (cur) sel.value = cur;
+    }
+  } catch (e) {}
+}
+
+function renderTable() {
+  const body = document.getElementById('taskTableBody');
+  if (!body) return;
+
+  // Загружаем проекты в фильтр если ещё не загружены
+  if (!projectsCache.length) loadProjectsForTable();
+
+  const statusFilter = document.getElementById('tFilterStatus').value;
+  const priorityFilter = document.getElementById('tFilterPriority').value;
+  const projectFilter = document.getElementById('tFilterProject').value;
+  const groupBy = document.getElementById('tGroupBy').value;
+
+  let tasks = allTasks.filter(t => {
+    if (!searchMatches(t)) return false;
+    if (statusFilter && t.status !== statusFilter) return false;
+    if (priorityFilter && t.priority !== priorityFilter) return false;
+    if (projectFilter && String(t.project_id || '') !== projectFilter) return false;
+    return true;
+  });
+
+  // Сортировка
+  tasks.sort((a, b) => {
+    let va = a[tableSortBy], vb = b[tableSortBy];
+    if (tableSortBy === 'priority') {
+      const order = { high: 0, medium: 1, low: 2 };
+      va = order[va] ?? 3;
+      vb = order[vb] ?? 3;
+    }
+    if (tableSortBy === 'status') {
+      const order = { active: 0, done: 1 };
+      va = order[va] ?? 2;
+      vb = order[vb] ?? 2;
+    }
+    if (va == null) va = '';
+    if (vb == null) vb = '';
+    if (va < vb) return tableSortDir === 'asc' ? -1 : 1;
+    if (va > vb) return tableSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  document.getElementById('tCount').textContent = tasks.length;
+
+  // Update sort indicators in header
+  document.querySelectorAll('#taskTableHead th[data-sort]').forEach(th => {
+    th.classList.remove('sorted-asc', 'sorted-desc');
+    if (th.dataset.sort === tableSortBy) {
+      th.classList.add(tableSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+    }
+  });
+
   if (!tasks.length) {
-    container.innerHTML = `<div class="empty-state">
-      <div class="empty-icon">○</div>
-      <div class="empty-title">Задач нет</div>
-      <div class="empty-desc">Создайте первую через кнопку «+ Задача»</div>
-    </div>`;
+    body.innerHTML = `<tr><td colspan="11" style="padding:60px 20px;text-align:center;color:var(--text-tertiary);">
+      <div style="font-size:32px;opacity:0.5;margin-bottom:8px;">○</div>
+      <div>Задач не найдено</div>
+    </td></tr>`;
     return;
   }
-  // Group by status
-  const active = tasks.filter(t => t.status === 'active');
-  const done = tasks.filter(t => t.status === 'done');
+
+  // Группировка
   let html = '';
-  if (active.length) {
-    html += `<div class="list-section">
-      <div class="list-section-header">
-        <span class="list-section-title">Активные</span>
-        <span class="list-section-count">${active.length}</span>
-      </div>${active.map(t => taskRow(t)).join('')}</div>`;
+  if (groupBy) {
+    const groups = {};
+    const groupOrder = [];
+    tasks.forEach(t => {
+      let key;
+      if (groupBy === 'status') {
+        key = t.status === 'done' ? '✓ Готовые' : '● Активные';
+      } else if (groupBy === 'priority') {
+        const map = { high: '🔴 Критические', medium: '🔵 Средние', low: '⚪ Низкие' };
+        key = map[t.priority] || 'Без приоритета';
+      } else if (groupBy === 'project') {
+        if (t.project_id) {
+          const p = projectsCache.find(x => x.id === t.project_id);
+          key = p ? `${p.emoji || '📁'} ${p.name}` : '📁 Проект #' + t.project_id;
+        } else {
+          key = '— Без проекта';
+        }
+      } else if (groupBy === 'category') {
+        key = t.category ? `📂 ${t.category}` : '— Без категории';
+      } else {
+        key = 'Все';
+      }
+      if (!groups[key]) { groups[key] = []; groupOrder.push(key); }
+      groups[key].push(t);
+    });
+
+    for (const key of groupOrder) {
+      html += `<tr><td colspan="11" style="background:var(--bg-base);padding:10px 14px;font-family:var(--font-mono);font-size:11px;color:var(--text-tertiary);letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid var(--border-default);border-top:1px solid var(--border-default);">
+        ${esc(key)} <span style="color:var(--text-disabled);">· ${groups[key].length}</span>
+      </td></tr>`;
+      html += groups[key].map(t => tableRow(t)).join('');
+    }
+  } else {
+    html = tasks.map(t => tableRow(t)).join('');
   }
-  if (done.length) {
-    html += `<div class="list-section">
-      <div class="list-section-header">
-        <span class="list-section-title">Выполнено</span>
-        <span class="list-section-count">${done.length}</span>
-      </div>${done.map(t => taskRow(t)).join('')}</div>`;
-  }
-  container.innerHTML = html;
+  body.innerHTML = html;
 }
+
+function tableRow(t) {
+  const p = t.priority || 'medium';
+  const isDone = t.status === 'done';
+  const isOverdue = !isDone && t.deadline && new Date(t.deadline) < new Date();
+  const typeIcons = { task: '☐', bug: '🐞', story: '📖', epic: '⚡', subtask: '↳' };
+  const typeIcon = typeIcons[t.task_type] || '☐';
+
+  // Assignees as overlapping avatars (max 3)
+  let assigneesHtml = '<span style="color:var(--text-disabled);">—</span>';
+  if (t.assignees && t.assignees.length) {
+    const shown = t.assignees.slice(0, 3);
+    const more = t.assignees.length - shown.length;
+    assigneesHtml = '<div class="cell-assignees">';
+    shown.forEach(a => {
+      const name = a.first_name || a.username || 'U';
+      const initial = name.charAt(0).toUpperCase();
+      const tip = a.username ? '@' + a.username : name;
+      assigneesHtml += `<div class="tp-mini-avatar" title="${esc(tip)}">${initial}</div>`;
+    });
+    if (more > 0) {
+      assigneesHtml += `<div class="tp-mini-avatar" style="background:var(--bg-elevated);color:var(--text-secondary);">+${more}</div>`;
+    }
+    assigneesHtml += '</div>';
+  }
+
+  // Tags as chips
+  let tagsHtml = '<span style="color:var(--text-disabled);">—</span>';
+  if (t.tags) {
+    tagsHtml = t.tags.split(',').slice(0, 3).map(tag =>
+      `<span class="cell-mini-tag">${esc(tag.trim())}</span>`).join(' ');
+  }
+
+  const deadlineStr = t.deadline ? fmtDeadline(t.deadline) : '—';
+  const deadlineClass = isOverdue ? 'overdue' : '';
+
+  const createdStr = t.created_at
+    ? new Date(t.created_at).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' })
+    : '';
+
+  const statusLabel = { todo: 'TO DO', in_progress: 'В РАБОТЕ', done: 'ГОТОВО' };
+  const col = t.kanban_column || (isDone ? 'done' : 'todo');
+
+  return `
+    <tr onclick="openTaskPanel(${t.id})">
+      <td class="cell-type" title="${t.task_type || 'task'}">${typeIcon}</td>
+      <td class="cell-key">${getTaskKey(t)}</td>
+      <td class="cell-title"><span class="truncate">${esc(t.title)}</span></td>
+      <td class="cell-status"><span class="cell-status-pill ${col}">${statusLabel[col] || col.toUpperCase()}</span></td>
+      <td style="text-align:center;">${t.comment_count ? `<span class="cell-comments">💬 ${t.comment_count}</span>` : '<span style="color:var(--text-disabled);">—</span>'}</td>
+      <td>${t.category ? `<span class="cell-mini-tag" style="color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent-dim);">${esc(t.category)}</span>` : '<span style="color:var(--text-disabled);">—</span>'}</td>
+      <td>${assigneesHtml}</td>
+      <td><span class="cell-date ${deadlineClass}">${deadlineStr}</span></td>
+      <td><span class="cell-priority ${p}">${p.toUpperCase()}</span></td>
+      <td>${tagsHtml}</td>
+      <td><span class="cell-date">${createdStr}</span></td>
+    </tr>`;
+}
+
+// Handle table header clicks for sorting
+document.addEventListener('click', e => {
+  const th = e.target.closest('#taskTableHead th[data-sort]');
+  if (!th) return;
+  const col = th.dataset.sort;
+  if (tableSortBy === col) {
+    tableSortDir = tableSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    tableSortBy = col;
+    tableSortDir = 'asc';
+  }
+  renderTable();
+});
 
 /* ─── KANBAN ─── */
 

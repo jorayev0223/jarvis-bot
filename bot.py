@@ -14,13 +14,15 @@ from datetime import datetime, timedelta
 
 import anthropic
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
+    CallbackQueryHandler, PreCheckoutQueryHandler, ContextTypes, filters,
 )
 
 import database as db
+import subscriptions as subs
+import webhooks as wh
 from ai_assistant import extract_task_from_text, generate_status_report
 
 # ─── Настройка ────────────────────────────────────────────────
@@ -235,6 +237,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/projects — проекты\n"
         "/newproject Имя — создать проект\n"
         "/dashboard — веб-дашборд\n"
+        "/plan — текущий тариф\n"
+        "/upgrade — улучшить тариф\n"
         "/help — помощь"
     )
     # Если админ — показываем ещё админ-команды
@@ -264,10 +268,9 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     await update.message.reply_text(
-        f"👤 Ваш user\\_id: `{user.id}`\n"
-        f"💬 chat\\_id: `{chat.id}`\n"
-        f"📛 username: @{user.username or '—'}",
-        parse_mode="Markdown")
+        f"👤 Ваш user_id: {user.id}\n"
+        f"💬 chat_id: {chat.id}\n"
+        f"📛 username: @{user.username or '—'}")
 
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_from_update(update)
@@ -427,6 +430,8 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     task = db.complete_task(task_id, update.effective_user.id, update.effective_chat.id)
     if task:
+        # Веб-хук: задача выполнена
+        wh.trigger_event("task.completed", update.effective_chat.id, task=task)
         await update.message.reply_text(f"✅ Задача *#{task_id}* выполнена!", parse_mode="Markdown")
         # Уведомляем исполнителей
         user_name = update.effective_user.first_name or "Кто-то"
@@ -446,7 +451,11 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Укажите номер задачи.")
         return
+    # Получаем задачу для веб-хука ДО удаления
+    task = db.get_task(task_id)
     if db.delete_task(task_id, update.effective_user.id, update.effective_chat.id):
+        if task:
+            wh.trigger_event("task.deleted", update.effective_chat.id, task=task)
         await update.message.reply_text(f"🗑 Задача *#{task_id}* удалена.", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Задача не найдена.")
@@ -563,10 +572,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.check_access(user.id, q.message.chat_id, user.username or ""):
         return
 
+    if d.startswith("buy_"):
+        await handle_buy_callback(update, context)
+        return
+
     if d.startswith("done_"):
         tid = int(d.split("_")[1])
         task = db.complete_task(tid, user.id, q.message.chat_id)
         if task:
+            wh.trigger_event("task.completed", q.message.chat_id, task=task)
             await q.edit_message_text(f"✅ Задача *#{tid}* выполнена!\n\n{format_task(task)}", parse_mode="Markdown")
             user_name = user.first_name or "Кто-то"
             await notify_assignees(context, task, exclude_user_id=user.id,
@@ -574,7 +588,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d.startswith("del_"):
         tid = int(d.split("_")[1])
+        task = db.get_task(tid)
         if db.delete_task(tid, user.id, q.message.chat_id):
+            if task:
+                wh.trigger_event("task.deleted", q.message.chat_id, task=task)
             await q.edit_message_text(f"🗑 Задача *#{tid}* удалена.", parse_mode="Markdown")
 
     elif d.startswith("post_"):
@@ -740,25 +757,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем ожидающие действия
     if context.user_data.get("await_subtask"):
         tid = context.user_data.pop("await_subtask")
+        added_titles = []
         for line in text.split("\n"):
             line = line.strip()
             if line:
                 db.add_subtask(tid, line)
+                added_titles.append(line)
         t = db.get_task(tid)
-        subs = t.get("subtasks", [])
-        done_c = sum(1 for s in subs if s["done"])
+        # Веб-хук на каждую добавленную подзадачу
+        for title in added_titles:
+            wh.trigger_event("subtask.added", update.effective_chat.id, task=t,
+                             extra={"subtask": {"title": title}})
+        subtasks_list = t.get("subtasks", [])
+        done_c = sum(1 for s in subtasks_list if s["done"])
         await update.message.reply_text(
-            f"📝 *Подзадачи #{tid}* ({done_c}/{len(subs)})\n_{t['title']}_",
-            parse_mode="Markdown", reply_markup=subtask_btns(tid, subs))
+            f"📝 *Подзадачи #{tid}* ({done_c}/{len(subtasks_list)})\n_{t['title']}_",
+            parse_mode="Markdown", reply_markup=subtask_btns(tid, subtasks_list))
         return
 
     if context.user_data.get("await_comment"):
         tid = context.user_data.pop("await_comment")
         name = update.effective_user.first_name or update.effective_user.username or "?"
         db.add_comment(tid, update.effective_user.id, name, text)
+        # Веб-хук: комментарий добавлен
+        task = db.get_task(tid)
+        if task:
+            wh.trigger_event("comment.added", update.effective_chat.id, task=task,
+                             extra={"comment": {"text": text, "author": name}})
         await update.message.reply_text(f"💬 Комментарий добавлен к задаче *#{tid}*", parse_mode="Markdown")
         # Уведомляем остальных
-        task = db.get_task(tid)
         if task:
             await notify_assignees(context, task, exclude_user_id=update.effective_user.id,
                 message=f"💬 *{name}* добавил комментарий к задаче *#{tid}*: {task['title']}\n\n_{text}_")
@@ -768,6 +795,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = context.user_data.pop("await_tags")
         db.update_tags(tid, text)
         t = db.get_task(tid)
+        wh.trigger_event("task.updated", update.effective_chat.id, task=t)
         await update.message.reply_text(
             f"🏷 Теги обновлены!\n\n{format_task(t)}", parse_mode="Markdown",
             reply_markup=task_buttons(tid))
@@ -780,8 +808,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for uname in usernames:
                 real_id = db.get_user_id_by_username(uname)
                 db.add_assignee(tid, real_id or 0, username=uname)
-                # Уведомляем назначенного в личку
                 task = db.get_task(tid)
+                # Веб-хук: исполнитель назначен
+                wh.trigger_event("assignee.added", update.effective_chat.id, task=task,
+                                 extra={"assignee": {"username": uname, "user_id": real_id or 0}})
+                # Уведомляем назначенного в личку
                 creator_name = update.effective_user.first_name or "Кто-то"
                 await notify_single_user(context, user_id=real_id, username=uname,
                     message=f"📩 *{creator_name}* назначил вам задачу *#{tid}*: {task['title']}\n\n"
@@ -813,6 +844,19 @@ async def _process_task_text(update, context, text, processing_msg):
     creator_name = user.first_name or user.username or "?"
     chat_id = update.effective_chat.id
 
+    # Проверка лимита задач
+    can_create, plan = subs.check_task_limit(chat_id)
+    if not can_create:
+        msg = subs.get_upgrade_limit_message(plan, f"Лимит {plan['max_tasks']} задач достигнут.")
+        await processing_msg.edit_text(msg, parse_mode="Markdown")
+        return
+
+    # Проверка фичи повторяющихся задач
+    if result.get("recurrence"):
+        can_recur, _ = subs.check_feature(chat_id, "recurring_tasks")
+        if not can_recur:
+            result["recurrence"] = None  # убираем повтор для free
+
     task = db.add_task(
         chat_id=chat_id,
         creator_id=user.id,
@@ -825,11 +869,17 @@ async def _process_task_text(update, context, text, processing_msg):
         recurrence=result.get("recurrence"),
     )
 
+    # Веб-хук: задача создана
+    wh.trigger_event("task.created", chat_id, task=task)
+
     # Назначение @упомянутых
     mentioned = result.get("mentioned_usernames", [])
     for uname in mentioned:
         real_id = db.get_user_id_by_username(uname)
         db.add_assignee(task["id"], real_id or 0, username=uname)
+        # Веб-хук: исполнитель назначен
+        wh.trigger_event("assignee.added", chat_id, task=task,
+                         extra={"assignee": {"username": uname, "user_id": real_id or 0}})
         # Уведомляем назначенного лично
         await notify_single_user(context, user_id=real_id, username=uname,
             message=f"📩 *{creator_name}* назначил вам задачу *#{task['id']}*: {task['title']}\n\n"
@@ -952,6 +1002,146 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка напоминания: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════
+#  ПОДПИСКИ И ОПЛАТА
+# ═══════════════════════════════════════════════════════════════
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущий тариф."""
+    track_user_from_update(update)
+    if not await check_access(update):
+        return
+    chat_id = update.effective_chat.id
+    text = subs.format_plan_info(chat_id)
+    text += "\n\nИзменить тариф: /upgrade"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает тарифы и кнопки оплаты."""
+    track_user_from_update(update)
+    if not await check_access(update):
+        return
+    text = subs.format_plans_comparison()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Basic — 250 Stars", callback_data="buy_basic")],
+        [InlineKeyboardButton("💎 Business — 500 Stars", callback_data="buy_business")],
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия кнопки покупки."""
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+
+    if d == "buy_basic":
+        plan_id = "basic"
+        plan = subs.PLANS["basic"]
+    elif d == "buy_business":
+        plan_id = "business"
+        plan = subs.PLANS["business"]
+    else:
+        return
+
+    # Отправляем invoice через Telegram Stars
+    try:
+        await context.bot.send_invoice(
+            chat_id=q.message.chat_id,
+            title=f"J.A.R.V.I.S. {plan['name']}",
+            description=f"Подписка {plan['name']} на 30 дней. "
+                        f"До {plan['max_users']} пользователей.",
+            payload=f"sub_{plan_id}_{q.message.chat_id}",
+            currency="XTR",  # Telegram Stars
+            prices=[LabeledPrice(label=plan["name"], amount=plan["price_stars"])],
+        )
+    except Exception as e:
+        logger.error(f"Ошибка создания invoice: {e}")
+        # Если Stars не поддерживается, предлагаем ручную активацию
+        await q.message.reply_text(
+            f"⚠️ Автооплата недоступна.\n\n"
+            f"Для активации тарифа *{plan['name']}* "
+            f"свяжитесь с администратором.\n\n"
+            f"Админ может активировать вручную:\n"
+            f"`/activate {plan_id}`",
+            parse_mode="Markdown")
+
+
+async def handle_pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение оплаты (обязательный шаг для Telegram Stars)."""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка успешной оплаты."""
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload  # "sub_basic_123456789"
+    parts = payload.split("_")
+
+    if len(parts) >= 2 and parts[0] == "sub":
+        plan_id = parts[1]
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        amount = payment.total_amount
+
+        subs.activate_plan(
+            chat_id=chat_id,
+            plan_name=plan_id,
+            user_id=user_id,
+            months=1,
+            payment_id=payment.telegram_payment_charge_id or "",
+            amount_stars=amount
+        )
+
+        plan = subs.PLANS.get(plan_id, {})
+        await update.message.reply_text(
+            f"🎉 *Оплата прошла успешно!*\n\n"
+            f"{plan.get('emoji', '⭐')} Тариф *{plan.get('name', plan_id)}* активирован на 30 дней!\n\n"
+            f"Спасибо за поддержку, сэр! 🤖",
+            parse_mode="Markdown")
+        logger.info(f"💰 Оплата: chat={chat_id}, plan={plan_id}, stars={amount}")
+
+
+async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручная активация тарифа (только для админов)."""
+    track_user_from_update(update)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Только для администраторов.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Укажите тариф: /activate basic или /activate business\n"
+            "Для конкретного чата: /activate basic -123456789")
+        return
+
+    plan_id = context.args[0].lower()
+    if plan_id not in ("basic", "business", "free"):
+        await update.message.reply_text("Тарифы: free, basic, business")
+        return
+
+    # Можно указать chat_id вторым аргументом
+    if len(context.args) > 1:
+        try:
+            chat_id = int(context.args[1])
+        except ValueError:
+            chat_id = update.effective_chat.id
+    else:
+        chat_id = update.effective_chat.id
+
+    if plan_id == "free":
+        subs.cancel_plan(chat_id)
+        await update.message.reply_text(
+            f"🆓 Чат `{chat_id}` переведён на Free.", parse_mode="Markdown")
+    else:
+        subs.activate_plan(chat_id, plan_id, update.effective_user.id, months=1)
+        plan = subs.PLANS[plan_id]
+        await update.message.reply_text(
+            f"{plan['emoji']} Тариф *{plan['name']}* активирован для чата `{chat_id}` на 30 дней!",
+            parse_mode="Markdown")
+
+
 async def morning_digest(context: ContextTypes.DEFAULT_TYPE):
     """Утренний дайджест в 09:00 UTC+5 (04:00 UTC)."""
     chats = db.get_all_chats_with_tasks()
@@ -994,6 +1184,7 @@ def main():
     logger.info("🤖 J.A.R.V.I.S. v5.1 инициализация...")
 
     db.init_db()
+    subs.init_subscription_tables()
     logger.info("✅ База данных готова")
 
     # Запуск веб-сервера в отдельном потоке
@@ -1029,6 +1220,13 @@ def main():
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("addchat", cmd_addchat))
     app.add_handler(CommandHandler("removechat", cmd_removechat))
+
+    # Подписки
+    app.add_handler(CommandHandler("plan", cmd_plan))
+    app.add_handler(CommandHandler("upgrade", cmd_upgrade))
+    app.add_handler(CommandHandler("activate", cmd_activate))
+    app.add_handler(PreCheckoutQueryHandler(handle_pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
 
     # Кнопки
     app.add_handler(CallbackQueryHandler(handle_callback))
